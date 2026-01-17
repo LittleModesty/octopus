@@ -44,7 +44,13 @@ func (o *ResponseOutbound) TransformRequest(ctx context.Context, request *model.
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	// Some OpenAI-compatible gateways change behavior when `stream` is omitted.
+	// Prefer an explicit Accept to match our requested mode.
+	if request.Stream != nil && *request.Stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 	req.Header.Set("Authorization", "Bearer "+key)
 
 	// Parse and set URL
@@ -439,11 +445,18 @@ type ResponsesStreamEvent struct {
 // Conversion functions
 
 func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest {
+	// Some gateways default to streaming if `stream` is omitted. If the inbound request
+	// doesn't specify streaming, explicitly request non-streaming.
+	stream := req.Stream
+	if stream == nil {
+		stream = lo.ToPtr(false)
+	}
+
 	result := &ResponsesRequest{
 		Model:             req.Model,
 		Temperature:       req.Temperature,
 		TopP:              req.TopP,
-		Stream:            req.Stream,
+		Stream:            stream,
 		Store:             req.Store,
 		ServiceTier:       req.ServiceTier,
 		User:              req.User,

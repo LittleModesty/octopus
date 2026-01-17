@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -150,6 +151,9 @@ func parseRequest(inboundType inbound.InboundType, c *gin.Context) (*model.Inter
 		return nil, nil, err
 	}
 
+	// Preserve the raw inbound body for debugging/dump.
+	internalRequest.RawRequest = body
+
 	// Pass through the original query parameters
 	internalRequest.Query = c.Request.URL.Query()
 
@@ -165,24 +169,76 @@ func parseRequest(inboundType inbound.InboundType, c *gin.Context) (*model.Inter
 func (rc *relayContext) forward() (int, error) {
 	ctx := rc.c.Request.Context()
 
+	// Optional debug dump (raw inbound/outbound/upstream) for troubleshooting.
+	dump := newRelayDump(loadRelayDumpConfig())
+	if dump != nil && rc.internalRequest != nil {
+		dump.setInbound(rc.c.Request, rc.internalRequest.RawRequest)
+	}
+
+	// Some upstream OpenAI-compatible gateways reject the `metadata` field entirely
+	// (e.g. "Unsupported parameter: metadata"). Anthropic requests often include
+	// `metadata.user_id`, which we store in InternalLLMRequest.Metadata["user_id"].
+	// Only drop that user_id when bridging Anthropic inbound -> OpenAI outbound.
+	reqForOutbound := rc.internalRequest
+	if reqForOutbound != nil &&
+		reqForOutbound.RawAPIFormat == model.APIFormatAnthropicMessage &&
+		(rc.channel.Type == outbound.OutboundTypeOpenAIChat || rc.channel.Type == outbound.OutboundTypeOpenAIResponse) {
+		cloned := *reqForOutbound // shallow copy is fine; we only rewrite Metadata
+		if reqForOutbound.Metadata != nil {
+			md := make(map[string]string, len(reqForOutbound.Metadata))
+			for k, v := range reqForOutbound.Metadata {
+				if k == "user_id" {
+					continue
+				}
+				md[k] = v
+			}
+			if len(md) == 0 {
+				cloned.Metadata = nil
+			} else {
+				cloned.Metadata = md
+			}
+		}
+		reqForOutbound = &cloned
+		// Keep logs/metrics aligned with the request we actually send upstream.
+		if rc.metrics != nil {
+			rc.metrics.SetInternalRequest(reqForOutbound)
+		}
+	}
+
 	// 构建出站请求
 	outboundRequest, err := rc.outAdapter.TransformRequest(
 		ctx,
-		rc.internalRequest,
+		reqForOutbound,
 		rc.channel.GetBaseUrl(),
 		rc.usedKey.ChannelKey,
 	)
 	if err != nil {
 		log.Warnf("failed to create request: %v", err)
+		if dump != nil {
+			dump.setError(err)
+			dump.write(false)
+		}
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	// 复制请求头
 	rc.copyHeaders(outboundRequest)
 
+	// Capture the outbound request body (then rewind it).
+	if dump != nil && outboundRequest.Body != nil {
+		if b, readErr := io.ReadAll(outboundRequest.Body); readErr == nil {
+			dump.setOutbound(outboundRequest, b)
+			outboundRequest.Body = io.NopCloser(bytes.NewReader(b))
+		}
+	}
+
 	// 发送请求
 	response, err := rc.sendRequest(outboundRequest)
 	if err != nil {
+		if dump != nil {
+			dump.setError(err)
+			dump.write(false)
+		}
 		return 0, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer response.Body.Close()
@@ -191,20 +247,51 @@ func (rc *relayContext) forward() (int, error) {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, err := io.ReadAll(response.Body)
 		if err != nil {
+			if dump != nil {
+				dump.setError(err)
+				dump.write(false)
+			}
 			return 0, fmt.Errorf("failed to read response body: %w", err)
+		}
+		if dump != nil {
+			dump.setUpstream(response, body)
+			dump.setError(fmt.Errorf("upstream error: %d", response.StatusCode))
+			dump.write(false)
 		}
 		return 0, fmt.Errorf("upstream error: %d: %s", response.StatusCode, string(body))
 	}
 
 	// 处理响应
-	if rc.internalRequest.Stream != nil && *rc.internalRequest.Stream {
-		if err := rc.handleStreamResponse(ctx, response); err != nil {
+	wantStream := rc.internalRequest.Stream != nil && *rc.internalRequest.Stream
+	upstreamCT := strings.ToLower(response.Header.Get("Content-Type"))
+	upstreamIsSSE := strings.Contains(upstreamCT, "text/event-stream")
+
+	// Some OpenAI-compatible gateways always return SSE for `/responses` even when the client
+	// didn't request streaming (or omitted `stream`). If we try to treat it as JSON, we'll
+	// fail with errors like: invalid character 'e' looking for beginning of value.
+	if wantStream {
+		if err := rc.handleStreamResponse(ctx, response, dump); err != nil {
 			return 0, err
+		}
+		if dump != nil {
+			dump.write(true)
 		}
 		return response.StatusCode, nil
 	}
-	if err := rc.handleResponse(ctx, response); err != nil {
+	if upstreamIsSSE {
+		if err := rc.handleStreamResponseAsNonStream(ctx, response, dump); err != nil {
+			return 0, err
+		}
+		if dump != nil {
+			dump.write(true)
+		}
+		return response.StatusCode, nil
+	}
+	if err := rc.handleResponse(ctx, response, dump); err != nil {
 		return 0, err
+	}
+	if dump != nil {
+		dump.write(true)
 	}
 	return response.StatusCode, nil
 }
@@ -244,11 +331,21 @@ func (rc *relayContext) sendRequest(req *http.Request) (*http.Response, error) {
 }
 
 // handleStreamResponse 处理流式响应
-func (rc *relayContext) handleStreamResponse(ctx context.Context, response *http.Response) error {
+func (rc *relayContext) handleStreamResponse(ctx context.Context, response *http.Response, dump *relayDump) error {
+	if dump != nil {
+		// Capture status/headers even for streaming; body will be filled incrementally.
+		dump.setUpstream(response, nil)
+	}
+
 	// 流式响应应当是 SSE
 	// 某些上游可能会返回非SSE的JSON响应 (由于 Accept headers 配置错误)
 	if ct := response.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 16*1024))
+		if dump != nil {
+			dump.setUpstream(response, body)
+			dump.setError(fmt.Errorf("upstream returned non-SSE content-type %q", ct))
+			dump.write(false)
+		}
 		return fmt.Errorf("upstream returned non-SSE content-type %q for stream request: %s", ct, string(body))
 	}
 
@@ -309,7 +406,15 @@ func (rc *relayContext) handleStreamResponse(ctx context.Context, response *http
 			}
 			if r.err != nil {
 				log.Warnf("failed to read event: %v", r.err)
+				if dump != nil {
+					dump.setError(r.err)
+					dump.write(false)
+				}
 				return fmt.Errorf("failed to read stream event: %w", r.err)
+			}
+
+			if dump != nil && r.data != "" {
+				dump.appendUpstreamStreamData(r.data)
 			}
 
 			// 转换流式数据
@@ -340,6 +445,142 @@ func (rc *relayContext) handleStreamResponse(ctx context.Context, response *http
 	}
 }
 
+// handleStreamResponseAsNonStream consumes an upstream SSE response but returns a non-stream JSON response to the client.
+// This is used when the client did not request streaming, but the upstream returned `text/event-stream` anyway.
+func (rc *relayContext) handleStreamResponseAsNonStream(ctx context.Context, response *http.Response, dump *relayDump) error {
+	if dump != nil {
+		// Capture status/headers; body will be filled incrementally from SSE data.
+		dump.setUpstream(response, nil)
+	}
+
+	// Expect SSE.
+	if ct := response.Header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "text/event-stream") {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 16*1024))
+		if dump != nil {
+			dump.setUpstream(response, body)
+			dump.setError(fmt.Errorf("upstream returned non-SSE content-type %q", ct))
+			dump.write(false)
+		}
+		return fmt.Errorf("upstream returned non-SSE content-type %q for SSE response: %s", ct, string(body))
+	}
+
+	firstToken := true
+
+	// Same first-token timeout behavior as streaming: if upstream doesn't yield any SSE data in time,
+	// we can failover to the next channel without having written anything to the client.
+	type sseReadResult struct {
+		data string
+		err  error
+	}
+	results := make(chan sseReadResult, 1)
+	go func() {
+		defer close(results)
+		readCfg := &sse.ReadConfig{MaxEventSize: maxSSEEventSize}
+		for ev, err := range sse.Read(response.Body, readCfg) {
+			if err != nil {
+				results <- sseReadResult{err: err}
+				return
+			}
+			results <- sseReadResult{data: ev.Data}
+		}
+	}()
+
+	var firstTokenTimer *time.Timer
+	var firstTokenC <-chan time.Time
+	if firstToken && rc.firstTokenTimeOutSec > 0 {
+		firstTokenTimer = time.NewTimer(time.Duration(rc.firstTokenTimeOutSec) * time.Second)
+		firstTokenC = firstTokenTimer.C
+		defer func() {
+			if firstTokenTimer != nil {
+				firstTokenTimer.Stop()
+			}
+		}()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Infof("client disconnected, stopping upstream stream (non-stream mode)")
+			return nil
+		case <-firstTokenC:
+			log.Warnf("first token timeout (%ds), switching channel", rc.firstTokenTimeOutSec)
+			_ = response.Body.Close()
+			return fmt.Errorf("first token timeout (%ds)", rc.firstTokenTimeOutSec)
+		case r, ok := <-results:
+			if !ok {
+				// Stream ended. Aggregate to a single non-stream response.
+				internalResponse, _ := rc.inAdapter.GetInternalResponse(ctx)
+				if internalResponse == nil {
+					if dump != nil {
+						dump.setError(fmt.Errorf("empty upstream SSE response"))
+						dump.write(false)
+					}
+					return fmt.Errorf("empty upstream SSE response")
+				}
+				inResponse, err := rc.inAdapter.TransformResponse(ctx, internalResponse)
+				if err != nil {
+					log.Warnf("failed to transform response: %v", err)
+					return fmt.Errorf("failed to transform inbound response: %w", err)
+				}
+				rc.c.Data(http.StatusOK, "application/json", inResponse)
+				return nil
+			}
+			if r.err != nil {
+				log.Warnf("failed to read event: %v", r.err)
+				if dump != nil {
+					dump.setError(r.err)
+					dump.write(false)
+				}
+				return fmt.Errorf("failed to read stream event: %w", r.err)
+			}
+
+			if dump != nil && r.data != "" {
+				dump.appendUpstreamStreamData(r.data)
+			}
+
+			// Upstream SSE -> internal stream chunk
+			internalStream, err := rc.outAdapter.TransformStream(ctx, []byte(r.data))
+			if err != nil {
+				log.Warnf("failed to transform stream: %v", err)
+				if dump != nil {
+					dump.setError(err)
+					dump.write(false)
+				}
+				return fmt.Errorf("failed to transform outbound stream: %w", err)
+			}
+			if internalStream == nil {
+				continue
+			}
+
+			// Internal stream chunk -> inbound stream (ignored), but keep for aggregation via GetInternalResponse().
+			if _, err := rc.inAdapter.TransformStream(ctx, internalStream); err != nil {
+				log.Warnf("failed to transform stream: %v", err)
+				if dump != nil {
+					dump.setError(err)
+					dump.write(false)
+				}
+				return fmt.Errorf("failed to transform inbound stream: %w", err)
+			}
+
+			// Record first token time once we have any meaningful upstream event.
+			if firstToken {
+				rc.metrics.SetFirstTokenTime(time.Now())
+				firstToken = false
+				if firstTokenTimer != nil {
+					if !firstTokenTimer.Stop() {
+						select {
+						case <-firstTokenTimer.C:
+						default:
+						}
+					}
+					firstTokenTimer = nil
+					firstTokenC = nil
+				}
+			}
+		}
+	}
+}
+
 // transformStreamData 转换流式数据
 func (rc *relayContext) transformStreamData(ctx context.Context, data string) ([]byte, error) {
 	// 上游格式 → 内部格式
@@ -363,11 +604,23 @@ func (rc *relayContext) transformStreamData(ctx context.Context, data string) ([
 }
 
 // handleResponse 处理非流式响应
-func (rc *relayContext) handleResponse(ctx context.Context, response *http.Response) error {
+func (rc *relayContext) handleResponse(ctx context.Context, response *http.Response, dump *relayDump) error {
+	// Capture upstream body before adapters consume it, then rewind for parsing.
+	if dump != nil && response.Body != nil {
+		if b, readErr := io.ReadAll(response.Body); readErr == nil {
+			dump.setUpstream(response, b)
+			response.Body = io.NopCloser(bytes.NewReader(b))
+		}
+	}
+
 	// 上游格式 → 内部格式
 	internalResponse, err := rc.outAdapter.TransformResponse(ctx, response)
 	if err != nil {
 		log.Warnf("failed to transform response: %v", err)
+		if dump != nil {
+			dump.setError(err)
+			dump.write(false)
+		}
 		return fmt.Errorf("failed to transform outbound response: %w", err)
 	}
 
