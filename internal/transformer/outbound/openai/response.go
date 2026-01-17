@@ -261,6 +261,7 @@ type ResponsesRequest struct {
 	ToolChoice        *ResponsesToolChoice  `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                 `json:"parallel_tool_calls,omitempty"`
 	Stream            *bool                 `json:"stream,omitempty"`
+	StreamOptions     *model.StreamOptions  `json:"stream_options,omitempty"`
 	Text              *ResponsesTextOptions `json:"text,omitempty"`
 	Store             *bool                 `json:"store,omitempty"`
 	ServiceTier       *string               `json:"service_tier,omitempty"`
@@ -444,6 +445,7 @@ func ConvertToResponsesRequest(req *model.InternalLLMRequest) *ResponsesRequest 
 		Temperature:       req.Temperature,
 		TopP:              req.TopP,
 		Stream:            req.Stream,
+		StreamOptions:     req.StreamOptions,
 		Store:             req.Store,
 		ServiceTier:       req.ServiceTier,
 		User:              req.User,
@@ -517,22 +519,10 @@ func convertInstructionsFromMessages(msgs []model.Message) string {
 
 func convertInputFromMessages(msgs []model.Message) ResponsesInput {
 	if len(msgs) == 0 {
-		return ResponsesInput{}
+		return ResponsesInput{Items: []ResponsesItem{}}
 	}
 
-	// Check for simple single user message
-	nonSystemMsgs := make([]model.Message, 0)
-	for _, msg := range msgs {
-		if msg.Role != "system" && msg.Role != "developer" {
-			nonSystemMsgs = append(nonSystemMsgs, msg)
-		}
-	}
-
-	if len(nonSystemMsgs) == 1 && nonSystemMsgs[0].Content.Content != nil && nonSystemMsgs[0].Role == "user" {
-		return ResponsesInput{Text: nonSystemMsgs[0].Content.Content}
-	}
-
-	var items []ResponsesItem
+	items := make([]ResponsesItem, 0, len(msgs))
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "system", "developer":

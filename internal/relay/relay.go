@@ -175,15 +175,15 @@ func (rc *relayContext) forward() (int, error) {
 		dump.setInbound(rc.c.Request, rc.internalRequest.RawRequest)
 	}
 
-	// Some upstream OpenAI-compatible gateways reject the `metadata` field entirely
-	// (e.g. "Unsupported parameter: metadata"). Anthropic requests often include
-	// `metadata.user_id`, which we store in InternalLLMRequest.Metadata["user_id"].
-	// Only drop that user_id when bridging Anthropic inbound -> OpenAI outbound.
+	// Some upstream OpenAI-compatible gateways reject `metadata` or `temperature`.
+	// Anthropic requests often include `metadata.user_id`, which we store in InternalLLMRequest.Metadata["user_id"].
+	// Drop user_id and temperature when bridging Anthropic inbound -> OpenAI outbound.
 	reqForOutbound := rc.internalRequest
 	if reqForOutbound != nil &&
 		reqForOutbound.RawAPIFormat == model.APIFormatAnthropicMessage &&
 		(rc.channel.Type == outbound.OutboundTypeOpenAIChat || rc.channel.Type == outbound.OutboundTypeOpenAIResponse) {
-		cloned := *reqForOutbound // shallow copy is fine; we only rewrite Metadata
+		cloned := *reqForOutbound // shallow copy is fine; we only rewrite Metadata/Temperature
+		cloned.Temperature = nil
 		if reqForOutbound.Metadata != nil {
 			md := make(map[string]string, len(reqForOutbound.Metadata))
 			for k, v := range reqForOutbound.Metadata {

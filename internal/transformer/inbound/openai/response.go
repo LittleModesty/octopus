@@ -708,6 +708,7 @@ type ResponsesRequest struct {
 	ToolChoice        *ResponsesToolChoice  `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                 `json:"parallel_tool_calls,omitempty"`
 	Stream            *bool                 `json:"stream,omitempty"`
+	StreamOptions     *model.StreamOptions  `json:"stream_options,omitempty"`
 	Text              *ResponsesTextOptions `json:"text,omitempty"`
 	Store             *bool                 `json:"store,omitempty"`
 	ServiceTier       *string               `json:"service_tier,omitempty"`
@@ -943,6 +944,7 @@ func convertToInternalRequest(req *ResponsesRequest) (*model.InternalLLMRequest,
 		Temperature:         req.Temperature,
 		TopP:                req.TopP,
 		Stream:              req.Stream,
+		StreamOptions:       req.StreamOptions,
 		Store:               req.Store,
 		ServiceTier:         req.ServiceTier,
 		User:                req.User,
